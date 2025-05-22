@@ -1,0 +1,29 @@
+---
+description: 
+globs: *
+alwaysApply: false
+---
+# `codex-cli` Structure
+
+This rule details the structure of the `codex-cli` directory, which contains the Node.js/TypeScript frontend for the Codex application.
+
+## Key Subdirectories
+
+*   **[`codex-cli/src/`](mdc:codex-cli/src)**: This is the primary directory for the CLI's source code.
+    *   **[`codex-cli/src/components/`](mdc:codex-cli/src/components)**: Contains UI components, possibly using a framework like Ink for terminal-based interfaces. Notable subdirectories:
+        *   `chat/`: Components related to chat functionality.
+        *   `onboarding/`: Components for the user onboarding process.
+        *   `select-input/`: Custom select input components.
+    *   **[`codex-cli/src/hooks/`](mdc:codex-cli/src/hooks)**: Likely contains custom React hooks or similar state management logic if a hook-based architecture is used.
+    *   **[`codex-cli/src/utils/`](mdc:codex-cli/src/utils)**: Utility functions and modules supporting the CLI operations. Key subdirectories:
+        *   `agent/`: Code related to agent interactions or management, including a `sandbox/` for isolated execution.
+        *   `logger/`: Logging utilities.
+        *   `singlepass/`: Potentially related to a single-pass processing mechanism.
+        *   `storage/`: Utilities for local storage or data persistence.
+*   **[`codex-cli/bin/`](mdc:codex-cli/bin)**: Executable scripts or entry points for the CLI.
+*   **[`codex-cli/examples/`](mdc:codex-cli/examples)**: Contains example projects or usage scenarios for `codex-cli`.
+    *   Each subdirectory like `build-codex-demo/`, `camerascii/`, `impossible-pong/`, `prompt-analyzer/` represents a distinct example with its own `runs/` and `template/` folders.
+*   **[`codex-cli/scripts/`](mdc:codex-cli/scripts)**: Build scripts, development scripts, or other utility scripts specific to the `codex-cli` package.
+*   **[`codex-cli/tests/`](mdc:codex-cli/tests)**: Unit tests, integration tests, and related fixtures (`__fixtures__/`) and snapshots (`__snapshots__/`).
+
+Understanding this structure is key to navigating and contributing to the `codex-cli` component.

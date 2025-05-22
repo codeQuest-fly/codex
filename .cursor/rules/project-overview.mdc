@@ -1,0 +1,29 @@
+---
+description: 
+globs: *
+alwaysApply: false
+---
+# Project Overview
+
+This document provides a high-level overview of the `codex` project structure.
+
+## Core Components
+
+The project is primarily divided into two main parts:
+
+1.  **`codex-cli`**: This directory contains the Node.js-based command-line interface.
+    *   The main source code is likely located in [`codex-cli/src/`](mdc:codex-cli/src).
+    *   Examples for using the CLI can be found in [`codex-cli/examples/`](mdc:codex-cli/examples).
+
+2.  **`codex-rs`**: This directory houses the Rust components of the project, likely providing core functionality and performance-critical operations.
+    *   The core logic is expected to be in [`codex-rs/core/src/`](mdc:codex-rs/core/src).
+    *   There's also a CLI-related part in Rust at [`codex-rs/cli/src/`](mdc:codex-rs/cli/src).
+    *   Shared Rust utilities might be in [`codex-rs/common/src/`](mdc:codex-rs/common/src).
+
+## Other Important Directories
+
+*   **`.github/`**: Contains GitHub-specific files, such as issue templates ([`.github/ISSUE_TEMPLATE/`](mdc:.github/ISSUE_TEMPLATE)) and workflows ([`.github/workflows/`](mdc:.github/workflows)).
+*   **`docs/`**: General project documentation.
+*   **`scripts/`**: Utility scripts for the project.
+
+This rule helps in understanding the primary modules and their locations within the workspace.
