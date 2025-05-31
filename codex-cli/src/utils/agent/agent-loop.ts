@@ -43,8 +43,32 @@ const RATE_LIMIT_RETRY_WAIT_MS = parseInt(
   10,
 );
 
+// Enhanced proxy detection - check multiple environment variable formats
 // See https://github.com/openai/openai-node/tree/v4?tab=readme-ov-file#configuring-an-https-agent-eg-for-proxies
-const PROXY_URL = process.env["HTTPS_PROXY"];
+const getProxyUrl = (): string | undefined => {
+  // Check various proxy environment variables in order of preference
+  const proxyVars = [
+    'HTTPS_PROXY',
+    'https_proxy', 
+    'HTTP_PROXY',
+    'http_proxy',
+    'ALL_PROXY',
+    'all_proxy'
+  ];
+  
+  for (const varName of proxyVars) {
+    const value = process.env[varName];
+    if (value) {
+      log(`代理配置检测: 使用环境变量 ${varName}=${value}`);
+      return value;
+    }
+  }
+  
+  log('代理配置检测: 未找到任何代理环境变量');
+  return undefined;
+};
+
+const PROXY_URL = getProxyUrl();
 
 export type CommandConfirmation = {
   review: ReviewDecision;
@@ -331,6 +355,18 @@ export class AgentLoop {
       ...(timeoutMs !== undefined ? { timeout: timeoutMs } : {}),
     });
 
+    // 记录超时配置以便调试
+    log(`OpenAI client configured with timeout: ${timeoutMs}ms`);
+    log(`Using provider: ${this.provider}, baseURL: ${baseURL}`);
+    
+    // 记录代理配置状态
+    if (PROXY_URL) {
+      log(`代理配置: 已启用代理 ${PROXY_URL}`);
+      log(`代理配置: HttpsProxyAgent 已创建`);
+    } else {
+      log(`代理配置: 未配置代理，将直接连接`);
+    }
+
     if (this.provider.toLowerCase() === "azure") {
       this.oai = new AzureOpenAI({
         apiKey,
@@ -348,6 +384,13 @@ export class AgentLoop {
         httpAgent: PROXY_URL ? new HttpsProxyAgent(PROXY_URL) : undefined,
         ...(timeoutMs !== undefined ? { timeout: timeoutMs } : {}),
       });
+      
+      // 记录Azure OpenAI代理配置状态
+      if (PROXY_URL) {
+        log(`Azure OpenAI 代理配置: 已启用代理 ${PROXY_URL}`);
+      } else {
+        log(`Azure OpenAI 代理配置: 未配置代理，将直接连接`);
+      }
     }
 
     setSessionId(this.sessionId);
@@ -537,6 +580,10 @@ export class AgentLoop {
     input: Array<ResponseInputItem>,
     previousResponseId: string = "",
   ): Promise<void> {
+    console.log(`[DEBUG] AgentLoop.run() 开始执行！`);
+    log(`AgentLoop.run(): 方法开始执行 - input 长度: ${input.length}, previousResponseId: ${previousResponseId}`);
+    log(`AgentLoop.run(): terminated 状态: ${this.terminated}`);
+    log(`AgentLoop.run(): model: ${this.model}, provider: ${this.provider}`);
     // ---------------------------------------------------------------------
     // Top‑level error wrapper so that known transient network issues like
     // `ERR_STREAM_PREMATURE_CLOSE` do not crash the entire CLI process.
@@ -802,7 +849,11 @@ export class AgentLoop {
               !this.config.provider ||
               this.config.provider?.toLowerCase() === "openai"
                 ? (params: ResponseCreateParams) =>
-                    this.oai.responses.create(params)
+                    {
+                      // 打印最完整参数
+                      console.log(`AgentLoop.run(): 最完整参数: ${JSON.stringify(params, null, 2)}`);
+                      return this.oai.responses.create(params)
+                    }
                 : (params: ResponseCreateParams) =>
                     responsesCreateViaChatCompletions(
                       this.oai,
@@ -812,15 +863,19 @@ export class AgentLoop {
               `instructions (length ${mergedInstructions.length}): ${mergedInstructions}`,
             );
 
-            // eslint-disable-next-line no-await-in-loop
-            stream = await responseCall({
+            log(`AgentLoop.run(): 准备调用 OpenAI API - model=${this.model}, provider=${this.config.provider}`);
+            log(`AgentLoop.run(): turnInput length=${turnInput.length}, tools length=${tools.length}`);
+            log(`AgentLoop.run(): 请求参数 - stream=true, parallel_tool_calls=false`);
+
+            // 构建完整的请求参数对象
+            const requestParams = {
               model: this.model,
               instructions: mergedInstructions,
               input: turnInput,
-              stream: true,
+              stream: true as const,
               parallel_tool_calls: false,
               reasoning,
-              ...(this.config.flexMode ? { service_tier: "flex" } : {}),
+              ...(this.config.flexMode ? { service_tier: "flex" as const } : {}),
               ...(this.disableResponseStorage
                 ? { store: false }
                 : {
@@ -828,15 +883,42 @@ export class AgentLoop {
                     previous_response_id: lastResponseId || undefined,
                   }),
               tools: tools,
-              // Explicitly tell the model it is allowed to pick whatever
-              // tool it deems appropriate.  Omitting this sometimes leads to
-              // the model ignoring the available tools and responding with
-              // plain text instead (resulting in a missing tool‑call).
-              tool_choice: "auto",
-            });
+              tool_choice: "auto" as const,
+            };
+
+            // 打印完整的请求参数（用于调试）
+            log(`AgentLoop.run(): ========== 完整请求参数 ==========`);
+            log(`AgentLoop.run(): requestParams: ${JSON.stringify(requestParams, null, 2)}`);
+            log(`AgentLoop.run(): model: ${requestParams.model}`);
+            log(`AgentLoop.run(): stream: ${requestParams.stream}`);
+            log(`AgentLoop.run(): parallel_tool_calls: ${requestParams.parallel_tool_calls}`);
+            log(`AgentLoop.run(): tool_choice: ${requestParams.tool_choice}`);
+            log(`AgentLoop.run(): store: ${(requestParams as any).store}`);
+            log(`AgentLoop.run(): previous_response_id: ${(requestParams as any).previous_response_id || 'undefined'}`);
+            log(`AgentLoop.run(): service_tier: ${(requestParams as any).service_tier || 'undefined'}`);
+            log(`AgentLoop.run(): reasoning: ${JSON.stringify(requestParams.reasoning)}`);
+            log(`AgentLoop.run(): tools count: ${requestParams.tools.length}`);
+            log(`AgentLoop.run(): tools: ${JSON.stringify(requestParams.tools, null, 2)}`);
+            log(`AgentLoop.run(): instructions length: ${requestParams.instructions.length}`);
+            log(`AgentLoop.run(): instructions (前500字符): ${requestParams.instructions.substring(0, 500)}${requestParams.instructions.length > 500 ? '...' : ''}`);
+            log(`AgentLoop.run(): input count: ${requestParams.input.length}`);
+            log(`AgentLoop.run(): input: ${JSON.stringify(requestParams.input, null, 2)}`);
+            log(`AgentLoop.run(): ========== 请求参数结束 ==========`);
+
+            try {
+              stream = await responseCall(requestParams);
+              log(`AgentLoop.run(): responseCall 成功完成`);
+            } catch (responseCallError) {
+              log(`AgentLoop.run(): responseCall 失败 - ${responseCallError}`);
+              throw responseCallError;
+            }
+            log(`AgentLoop.run(): responseCall 完成，获得 stream 对象`);
             break;
           } catch (error) {
+            log(`AgentLoop.run(): API 调用出现错误 - ${error}`);
+            log(`AgentLoop.run(): 错误类型检查开始...`);
             const isTimeout = error instanceof APIConnectionTimeoutError;
+            log(`AgentLoop.run(): isTimeout=${isTimeout}`);
             // Lazily look up the APIConnectionError class at runtime to
             // accommodate the test environment's minimal OpenAI mocks which
             // do not define the class.  Falling back to `false` when the
@@ -848,10 +930,12 @@ export class AgentLoop {
             const isConnectionError = ApiConnErrCtor
               ? error instanceof ApiConnErrCtor
               : false;
+            log(`AgentLoop.run(): isConnectionError=${isConnectionError}`);
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             const errCtx = error as any;
             const status =
               errCtx?.status ?? errCtx?.httpStatus ?? errCtx?.statusCode;
+            log(`AgentLoop.run(): status=${status}, errCtx.type=${errCtx?.type}`);
             // Treat classical 5xx *and* explicit OpenAI `server_error` types
             // as transient server-side failures that qualify for a retry. The
             // SDK often omits the numeric status for these, reporting only
@@ -859,6 +943,7 @@ export class AgentLoop {
             const isServerError =
               (typeof status === "number" && status >= 500) ||
               errCtx?.type === "server_error";
+            log(`AgentLoop.run(): isServerError=${isServerError}, attempt=${attempt}/${MAX_RETRIES}`);
             if (
               (isTimeout || isServerError || isConnectionError) &&
               attempt < MAX_RETRIES
@@ -866,6 +951,14 @@ export class AgentLoop {
               log(
                 `OpenAI request failed (attempt ${attempt}/${MAX_RETRIES}), retrying...`,
               );
+              log(`AgentLoop.run(): 准备重试，错误详情: ${JSON.stringify({
+                isTimeout,
+                isServerError, 
+                isConnectionError,
+                status,
+                type: errCtx?.type,
+                message: errCtx?.message
+              })}`);
               continue;
             }
 
@@ -1026,6 +1119,7 @@ export class AgentLoop {
           return;
         }
 
+        log(`AgentLoop.run(): 开始处理流响应事件...`);
         const MAX_STREAM_RETRIES = 5;
         let streamRetryAttempt = 0;
 
@@ -1034,6 +1128,7 @@ export class AgentLoop {
           try {
             let newTurnInput: Array<ResponseInputItem> = [];
 
+            log(`AgentLoop.run(): 开始迭代流事件...`);
             // eslint-disable-next-line no-await-in-loop
             for await (const event of stream as AsyncIterable<ResponseEvent>) {
               log(`AgentLoop.run(): response event ${event.type}`);
@@ -1140,6 +1235,8 @@ export class AgentLoop {
             // Stream finished successfully – leave the retry loop.
             break;
           } catch (err: unknown) {
+            log(`AgentLoop.run(): 流处理出现错误 - ${err}`);
+            log(`AgentLoop.run(): 流错误类型检查开始...`);
             const isRateLimitError = (e: unknown): boolean => {
               if (!e || typeof e !== "object") {
                 return false;
@@ -1153,8 +1250,10 @@ export class AgentLoop {
               );
             };
 
+            const isRateLimit = isRateLimitError(err);
+            log(`AgentLoop.run(): isRateLimit=${isRateLimit}, streamRetryAttempt=${streamRetryAttempt}/${MAX_STREAM_RETRIES}`);
             if (
-              isRateLimitError(err) &&
+              isRateLimit &&
               streamRetryAttempt < MAX_STREAM_RETRIES
             ) {
               streamRetryAttempt += 1;
@@ -1206,10 +1305,10 @@ export class AgentLoop {
                 model: this.model,
                 instructions: mergedInstructions,
                 input: turnInput,
-                stream: true,
+                stream: true as const,
                 parallel_tool_calls: false,
                 reasoning,
-                ...(this.config.flexMode ? { service_tier: "flex" } : {}),
+                ...(this.config.flexMode ? { service_tier: "flex" as const } : {}),
                 ...(this.disableResponseStorage
                   ? { store: false }
                   : {
@@ -1217,7 +1316,7 @@ export class AgentLoop {
                       previous_response_id: lastResponseId || undefined,
                     }),
                 tools: tools,
-                tool_choice: "auto",
+                tool_choice: "auto" as const,
               });
 
               this.currentStream = stream;
@@ -1227,16 +1326,22 @@ export class AgentLoop {
 
             // Gracefully handle an abort triggered via `cancel()` so that the
             // consumer does not see an unhandled exception.
+            log(`AgentLoop.run(): 检查是否为 AbortError...`);
             if (err instanceof Error && err.name === "AbortError") {
+              log(`AgentLoop.run(): 确认为 AbortError, canceled=${this.canceled}`);
               if (!this.canceled) {
                 // It was aborted for some other reason; surface the error.
+                log(`AgentLoop.run(): AbortError 但未被取消，重新抛出错误`);
                 throw err;
               }
+              log(`AgentLoop.run(): AbortError 且已被取消，正常退出`);
               this.onLoading(false);
               return;
             }
             // Suppress internal stack on JSON parse failures
+            log(`AgentLoop.run(): 检查是否为 SyntaxError...`);
             if (err instanceof SyntaxError) {
+              log(`AgentLoop.run(): 确认为 SyntaxError (JSON 解析失败)`);
               this.onItem({
                 id: `error-${Date.now()}`,
                 type: "message",
@@ -1252,10 +1357,12 @@ export class AgentLoop {
               return;
             }
             // Handle OpenAI API quota errors
+            log(`AgentLoop.run(): 检查是否为配额不足错误...`);
             if (
               err instanceof Error &&
               (err as { code?: string }).code === "insufficient_quota"
             ) {
+              log(`AgentLoop.run(): 确认为配额不足错误`);
               this.onItem({
                 id: `error-${Date.now()}`,
                 type: "message",
@@ -1270,6 +1377,7 @@ export class AgentLoop {
               this.onLoading(false);
               return;
             }
+            log(`AgentLoop.run(): 未知错误类型，重新抛出: ${err}`);
             throw err;
           } finally {
             this.currentStream = null;

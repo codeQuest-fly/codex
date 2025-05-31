@@ -64,7 +64,7 @@ export const CONFIG_FILEPATH = CONFIG_JSON_FILEPATH;
 export const INSTRUCTIONS_FILEPATH = join(CONFIG_DIR, "instructions.md");
 
 export const OPENAI_TIMEOUT_MS =
-  parseInt(process.env["OPENAI_TIMEOUT_MS"] || "0", 10) || undefined;
+  parseInt(process.env["OPENAI_TIMEOUT_MS"] || "30000", 10) || 30000; // 默认30秒超时
 export const OPENAI_BASE_URL = process.env["OPENAI_BASE_URL"] || "";
 export let OPENAI_API_KEY = process.env["OPENAI_API_KEY"] || "";
 

@@ -14,6 +14,9 @@
     "resolveJsonModule": true, // ESM doesn't yet support JSON modules.
     "jsx": "react",
     "declaration": true,
+    "sourceMap": true,
+    "inlineSourceMap": false,
+    "inlineSources": false,
     "newLine": "lf",
     "stripInternal": true,
     "strict": true,
@@ -29,6 +32,15 @@
     "useDefineForClassFields": true,
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true
+  },
+  "ts-node": {
+    "esm": true,
+    "experimentalSpecifierResolution": "node",
+    "compilerOptions": {
+      "module": "ESNext",
+      "moduleResolution": "node",
+      "jsx": "react"
+    }
   },
   "include": ["src", "tests", "bin"]
 }

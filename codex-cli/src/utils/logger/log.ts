@@ -71,11 +71,14 @@ function now() {
 let logger: Logger;
 
 /**
+ * @Author dailingfei
+ * 日志工具模块 - 支持异步日志写入和文件管理
+ * 修改日志输出位置为当前工作目录下的logs文件夹
+ *
  * Creates a .log file for this session, but also symlinks codex-cli-latest.log
  * to the current log file so you can reliably run:
  *
- * - Mac/Windows: `tail -F "$TMPDIR/oai-codex/codex-cli-latest.log"`
- * - Linux: `tail -F ~/.local/oai-codex/codex-cli-latest.log`
+ * - `tail -F "./logs/codex-cli-latest.log"` (logs文件夹)
  */
 export function initLogger(): Logger {
   if (logger) {
@@ -85,16 +88,14 @@ export function initLogger(): Logger {
     return logger;
   }
 
-  const isMac = process.platform === "darwin";
   const isWin = process.platform === "win32";
 
-  // On Mac and Windows, os.tmpdir() returns a user-specific folder, so prefer
-  // it there. On Linux, use ~/.local/oai-codex so logs are not world-readable.
-  const logDir =
-    isMac || isWin
-      ? path.join(os.tmpdir(), "oai-codex")
-      : path.join(os.homedir(), ".local", "oai-codex");
+  // 使用当前工作目录下的logs文件夹作为日志输出位置
+  const logDir = path.join(process.cwd(), "logs");
+  
+  // 确保logs目录存在
   fsSync.mkdirSync(logDir, { recursive: true });
+  
   const logFile = path.join(logDir, `codex-cli-${now()}.log`);
   // Write the empty string so the file exists and can be tail'd.
   fsSync.writeFileSync(logFile, "");

@@ -69,6 +69,7 @@ const cli = meow(
   Usage
     $ codex [options] <prompt>
     $ codex completion <bash|zsh|fish>
+    $ codex diagnose
 
   Options
     --version                       Print version and exit
@@ -116,6 +117,7 @@ const cli = meow(
     $ codex "Write and run a python program that prints ASCII art"
     $ codex -q "fix build issues"
     $ codex completion bash
+    $ codex diagnose
 `,
   {
     importMeta: import.meta,
@@ -251,6 +253,85 @@ complete -c codex -a '(__fish_complete_path)' -d 'file path'`,
   // eslint-disable-next-line no-console
   console.log(script);
   process.exit(0);
+}
+
+// Handle 'diagnose' subcommand to help debug connection issues
+if (cli.input[0] === "diagnose") {
+  const { spawn } = require("child_process");
+  
+  // eslint-disable-next-line no-console
+  console.log(chalk.bold("🔍 Codex 诊断报告"));
+  // eslint-disable-next-line no-console
+  console.log("=".repeat(50));
+  
+  // Check Node.js version
+  // eslint-disable-next-line no-console
+  console.log(`Node.js 版本: ${process.version}`);
+  
+  // Check environment variables
+  // eslint-disable-next-line no-console
+  console.log(`OPENAI_TIMEOUT_MS: ${process.env["OPENAI_TIMEOUT_MS"] || "未设置 (将使用默认60秒)"}`);
+  // eslint-disable-next-line no-console
+  console.log(`OPENAI_BASE_URL: ${process.env["OPENAI_BASE_URL"] || "未设置 (将使用默认)"}`);
+  // eslint-disable-next-line no-console
+  console.log(`HTTPS_PROXY: ${process.env["HTTPS_PROXY"] || "未设置"}`);
+  // eslint-disable-next-line no-console
+  console.log(`HTTP_PROXY: ${process.env["HTTP_PROXY"] || "未设置"}`);
+  
+  // Test network connectivity
+  // eslint-disable-next-line no-console
+  console.log("\n🌐 网络连接测试:");
+  
+  try {
+    const testUrl = process.env["OPENAI_BASE_URL"] || "https://api.openai.com";
+    const curlProcess = spawn("curl", ["-s", "-o", "/dev/null", "-w", "%{http_code}", `${testUrl}/v1/models`], {
+      timeout: 10000
+    });
+    
+    curlProcess.on("close", (code: number | null) => {
+      if (code === 0) {
+        // eslint-disable-next-line no-console
+        console.log(`✅ API 连接正常`);
+      } else {
+        // eslint-disable-next-line no-console
+        console.log(`❌ API 连接异常 (退出码: ${code})`);
+        // eslint-disable-next-line no-console
+        console.log("建议:");
+        // eslint-disable-next-line no-console
+        console.log("  1. 检查网络连接");
+        // eslint-disable-next-line no-console
+        console.log("  2. 检查防火墙设置");
+        // eslint-disable-next-line no-console
+        console.log("  3. 如果使用代理，请检查代理配置");
+      }
+    });
+    
+    curlProcess.on("error", () => {
+      // eslint-disable-next-line no-console
+      console.log("❌ 无法执行网络测试 (curl 不可用)");
+    });
+    
+    setTimeout(() => {
+      // eslint-disable-next-line no-console
+      console.log("\n💡 解决建议:");
+      // eslint-disable-next-line no-console
+      console.log("  如果经常卡在 thinking 状态，请尝试:");
+      // eslint-disable-next-line no-console
+      console.log("  1. export OPENAI_TIMEOUT_MS=30000  # 设置30秒超时");
+      // eslint-disable-next-line no-console
+      console.log("  2. 使用 --quiet 模式测试: codex -q '测试'");
+      // eslint-disable-next-line no-console
+      console.log("  3. 尝试不同模型: codex -m gpt-4 '测试'");
+      // eslint-disable-next-line no-console
+      console.log("  4. 检查 API key 是否有效");
+      process.exit(0);
+    }, 3000);
+    
+  } catch (error: unknown) {
+    // eslint-disable-next-line no-console
+    console.log("❌ 网络测试失败:", error instanceof Error ? error.message : String(error));
+    process.exit(1);
+  }
 }
 
 // For --help, show help and exit.

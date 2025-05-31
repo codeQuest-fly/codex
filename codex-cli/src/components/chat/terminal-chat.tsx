@@ -198,7 +198,7 @@ export default function TerminalChat({
   const [overlayMode, setOverlayMode] = useState<OverlayModeType>("none");
   const [viewRollout, setViewRollout] = useState<AppRollout | null>(null);
 
-  // Store the diff text when opening the diff overlay so the view isn’t
+  // Store the diff text when opening the diff overlay so the view isn't
   // recomputed on every re‑render while it is open.
   // diffText is passed down to the DiffOverlay component. The setter is
   // currently unused but retained for potential future updates. Prefix with
@@ -316,7 +316,7 @@ export default function TerminalChat({
       forceUpdate(); // re‑render after teardown too
     };
     // We intentionally omit 'approvalPolicy' and 'confirmationPrompt' from the deps
-    // so switching modes or showing confirmation dialogs doesn’t tear down the loop.
+    // so switching modes or showing confirmation dialogs doesn't tear down the loop.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [model, provider, config, requestConfirmation, additionalWritableRoots]);
 
@@ -325,6 +325,7 @@ export default function TerminalChat({
   // re‑render every second during apply_patch reviews.
   useEffect(() => {
     let handle: ReturnType<typeof setInterval> | null = null;
+    let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
     // Only tick the "thinking…" timer when the agent is actually processing
     // a request *and* the user is not being asked to review a command.
     if (loading && confirmationPrompt == null) {
@@ -332,15 +333,39 @@ export default function TerminalChat({
       handle = setInterval(() => {
         setThinkingSeconds((s) => s + 1);
       }, 1000);
+      
+      // 添加30秒超时提示
+      timeoutHandle = setTimeout(() => {
+        setItems((prev) => [
+          ...prev,
+          {
+            id: `timeout-warning-${Date.now()}`,
+            type: "message",
+            role: "system",
+            content: [
+              {
+                type: "input_text",
+                text: "⚠️  请求处理时间较长，可能是网络连接问题或 OpenAI 服务响应缓慢。您可以按 Ctrl+C 中断当前请求。",
+              },
+            ],
+          },
+        ]);
+      }, 30000); // 30秒后显示警告
     } else {
       if (handle) {
         clearInterval(handle);
+      }
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
       }
       setThinkingSeconds(0);
     }
     return () => {
       if (handle) {
         clearInterval(handle);
+      }
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
       }
     };
   }, [loading, confirmationPrompt]);
@@ -575,7 +600,12 @@ export default function TerminalChat({
               ]);
             }}
             submitInput={(inputs) => {
+              log(`TerminalChat: submitInput 被调用，inputs 长度: ${inputs.length}`);
+              log(`TerminalChat: agent 存在: ${Boolean(agent)}`);
+              log(`TerminalChat: lastResponseId: ${lastResponseId || "空"}`);
+              log(`TerminalChat: 准备调用 agent.run()...`);
               agent.run(inputs, lastResponseId || "");
+              log(`TerminalChat: agent.run() 调用完成`);
               return {};
             }}
             items={items}
