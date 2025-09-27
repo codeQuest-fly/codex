@@ -30,7 +30,7 @@ use codex_core::protocol::McpToolCallBeginEvent;
 use codex_core::protocol::McpToolCallEndEvent;
 use codex_core::protocol::Op;
 use codex_core::protocol::PatchApplyBeginEvent;
-use codex_core::protocol::RateLimitSnapshotEvent;
+use codex_core::protocol::RateLimitSnapshot;
 use codex_core::protocol::ReviewRequest;
 use codex_core::protocol::StreamErrorEvent;
 use codex_core::protocol::TaskCompleteEvent;
@@ -59,6 +59,7 @@ use tracing::debug;
 
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
+use crate::bottom_pane::ApprovalRequest;
 use crate::bottom_pane::BottomPane;
 use crate::bottom_pane::BottomPaneParams;
 use crate::bottom_pane::CancellationEvent;
@@ -70,19 +71,20 @@ use crate::bottom_pane::custom_prompt_view::CustomPromptView;
 use crate::bottom_pane::popup_consts::STANDARD_POPUP_HINT_LINE;
 use crate::clipboard_paste::paste_image_to_temp_png;
 use crate::diff_render::display_path_for;
+use crate::exec_cell::CommandOutput;
+use crate::exec_cell::ExecCell;
+use crate::exec_cell::new_active_exec_command;
 use crate::get_git_diff::get_git_diff;
 use crate::history_cell;
 use crate::history_cell::AgentMessageCell;
-use crate::history_cell::CommandOutput;
-use crate::history_cell::ExecCell;
 use crate::history_cell::HistoryCell;
+use crate::history_cell::McpToolCallCell;
 use crate::history_cell::PatchEventType;
 use crate::markdown::append_markdown;
 use crate::slash_command::SlashCommand;
+use crate::status::RateLimitSnapshotDisplay;
 use crate::text_formatting::truncate_text;
 use crate::tui::FrameRequester;
-// streaming internals are provided by crate::streaming and crate::markdown_stream
-use crate::user_approval_widget::ApprovalRequest;
 mod interrupts;
 use self::interrupts::InterruptManager;
 mod agent;
@@ -90,9 +92,10 @@ use self::agent::spawn_agent;
 use self::agent::spawn_agent_from_existing;
 mod session_header;
 use self::session_header::SessionHeader;
-use crate::streaming::controller::AppEventHistorySink;
 use crate::streaming::controller::StreamController;
-//
+use std::path::Path;
+
+use chrono::Local;
 use codex_common::approval_presets::ApprovalPreset;
 use codex_common::approval_presets::builtin_approval_presets;
 use codex_common::model_presets::ModelPreset;
@@ -103,7 +106,13 @@ use codex_core::protocol::AskForApproval;
 use codex_core::protocol::SandboxPolicy;
 use codex_core::protocol_config_types::ReasoningEffort as ReasoningEffortConfig;
 use codex_file_search::FileMatch;
-use std::path::Path;
+use codex_git_tooling::CreateGhostCommitOptions;
+use codex_git_tooling::GhostCommit;
+use codex_git_tooling::GitToolingError;
+use codex_git_tooling::create_ghost_commit;
+use codex_git_tooling::restore_ghost_commit;
+
+const MAX_TRACKED_GHOST_COMMITS: usize = 20;
 
 // Track information about an in-flight exec command.
 struct RunningCommand {
@@ -111,39 +120,88 @@ struct RunningCommand {
     parsed_cmd: Vec<ParsedCommand>,
 }
 
-const RATE_LIMIT_WARNING_THRESHOLDS: [f64; 3] = [50.0, 75.0, 90.0];
+const RATE_LIMIT_WARNING_THRESHOLDS: [f64; 3] = [75.0, 90.0, 95.0];
 
 #[derive(Default)]
 struct RateLimitWarningState {
-    weekly_index: usize,
-    hourly_index: usize,
+    secondary_index: usize,
+    primary_index: usize,
 }
 
 impl RateLimitWarningState {
-    fn take_warnings(&mut self, weekly_used_percent: f64, hourly_used_percent: f64) -> Vec<String> {
-        let mut warnings = Vec::new();
-
-        while self.weekly_index < RATE_LIMIT_WARNING_THRESHOLDS.len()
-            && weekly_used_percent >= RATE_LIMIT_WARNING_THRESHOLDS[self.weekly_index]
-        {
-            let threshold = RATE_LIMIT_WARNING_THRESHOLDS[self.weekly_index];
-            warnings.push(format!(
-                "Weekly usage exceeded {threshold:.0}% of the limit. Run /limits for detailed usage."
-            ));
-            self.weekly_index += 1;
+    fn take_warnings(
+        &mut self,
+        secondary_used_percent: Option<f64>,
+        secondary_window_minutes: Option<u64>,
+        primary_used_percent: Option<f64>,
+        primary_window_minutes: Option<u64>,
+    ) -> Vec<String> {
+        let reached_secondary_cap =
+            matches!(secondary_used_percent, Some(percent) if percent == 100.0);
+        let reached_primary_cap = matches!(primary_used_percent, Some(percent) if percent == 100.0);
+        if reached_secondary_cap || reached_primary_cap {
+            return Vec::new();
         }
 
-        while self.hourly_index < RATE_LIMIT_WARNING_THRESHOLDS.len()
-            && hourly_used_percent >= RATE_LIMIT_WARNING_THRESHOLDS[self.hourly_index]
-        {
-            let threshold = RATE_LIMIT_WARNING_THRESHOLDS[self.hourly_index];
-            warnings.push(format!(
-                "Hourly usage exceeded {threshold:.0}% of the limit. Run /limits for detailed usage."
-            ));
-            self.hourly_index += 1;
+        let mut warnings = Vec::new();
+
+        if let Some(secondary_used_percent) = secondary_used_percent {
+            let mut highest_secondary: Option<f64> = None;
+            while self.secondary_index < RATE_LIMIT_WARNING_THRESHOLDS.len()
+                && secondary_used_percent >= RATE_LIMIT_WARNING_THRESHOLDS[self.secondary_index]
+            {
+                highest_secondary = Some(RATE_LIMIT_WARNING_THRESHOLDS[self.secondary_index]);
+                self.secondary_index += 1;
+            }
+            if let Some(threshold) = highest_secondary {
+                let limit_label = secondary_window_minutes
+                    .map(get_limits_duration)
+                    .unwrap_or_else(|| "weekly".to_string());
+                warnings.push(format!(
+                    "Heads up, you've used over {threshold:.0}% of your {limit_label} limit. Run /status for a breakdown."
+                ));
+            }
+        }
+
+        if let Some(primary_used_percent) = primary_used_percent {
+            let mut highest_primary: Option<f64> = None;
+            while self.primary_index < RATE_LIMIT_WARNING_THRESHOLDS.len()
+                && primary_used_percent >= RATE_LIMIT_WARNING_THRESHOLDS[self.primary_index]
+            {
+                highest_primary = Some(RATE_LIMIT_WARNING_THRESHOLDS[self.primary_index]);
+                self.primary_index += 1;
+            }
+            if let Some(threshold) = highest_primary {
+                let limit_label = primary_window_minutes
+                    .map(get_limits_duration)
+                    .unwrap_or_else(|| "5h".to_string());
+                warnings.push(format!(
+                    "Heads up, you've used over {threshold:.0}% of your {limit_label} limit. Run /status for a breakdown."
+                ));
+            }
         }
 
         warnings
+    }
+}
+
+pub(crate) fn get_limits_duration(windows_minutes: u64) -> String {
+    const MINUTES_PER_HOUR: u64 = 60;
+    const MINUTES_PER_DAY: u64 = 24 * MINUTES_PER_HOUR;
+    const MINUTES_PER_WEEK: u64 = 7 * MINUTES_PER_DAY;
+    const MINUTES_PER_MONTH: u64 = 30 * MINUTES_PER_DAY;
+    const ROUNDING_BIAS_MINUTES: u64 = 3;
+
+    if windows_minutes <= MINUTES_PER_DAY.saturating_add(ROUNDING_BIAS_MINUTES) {
+        let adjusted = windows_minutes.saturating_add(ROUNDING_BIAS_MINUTES);
+        let hours = std::cmp::max(1, adjusted / MINUTES_PER_HOUR);
+        format!("{hours}h")
+    } else if windows_minutes <= MINUTES_PER_WEEK.saturating_add(ROUNDING_BIAS_MINUTES) {
+        "weekly".to_string()
+    } else if windows_minutes <= MINUTES_PER_MONTH.saturating_add(ROUNDING_BIAS_MINUTES) {
+        "monthly".to_string()
+    } else {
+        "annual".to_string()
     }
 }
 
@@ -162,16 +220,16 @@ pub(crate) struct ChatWidget {
     app_event_tx: AppEventSender,
     codex_op_tx: UnboundedSender<Op>,
     bottom_pane: BottomPane,
-    active_exec_cell: Option<ExecCell>,
+    active_cell: Option<Box<dyn HistoryCell>>,
     config: Config,
     auth_manager: Arc<AuthManager>,
     session_header: SessionHeader,
     initial_user_message: Option<UserMessage>,
     token_info: Option<TokenUsageInfo>,
-    rate_limit_snapshot: Option<RateLimitSnapshotEvent>,
+    rate_limit_snapshot: Option<RateLimitSnapshotDisplay>,
     rate_limit_warnings: RateLimitWarningState,
     // Stream lifecycle controller
-    stream: StreamController,
+    stream_controller: Option<StreamController>,
     running_commands: HashMap<String, RunningCommand>,
     task_complete_pending: bool,
     // Queue of interruptive UI events deferred during an active write cycle
@@ -193,6 +251,11 @@ pub(crate) struct ChatWidget {
     pending_notification: Option<Notification>,
     // Simple review mode flag; used to adjust layout and banners.
     is_review_mode: bool,
+    // List of ghost commits corresponding to each turn.
+    ghost_snapshots: Vec<GhostCommit>,
+    ghost_snapshots_disabled: bool,
+    // Whether to add a final message separator after the last message
+    needs_final_message_separator: bool,
 }
 
 struct UserMessage {
@@ -219,9 +282,13 @@ fn create_initial_user_message(text: String, image_paths: Vec<PathBuf>) -> Optio
 
 impl ChatWidget {
     fn flush_answer_stream_with_separator(&mut self) {
-        let sink = AppEventHistorySink(self.app_event_tx.clone());
-        let _ = self.stream.finalize(true, &sink);
+        if let Some(mut controller) = self.stream_controller.take()
+            && let Some(cell) = controller.finalize()
+        {
+            self.add_boxed_history(cell);
+        }
     }
+
     // --- Small event handlers ---
     fn on_session_configured(&mut self, event: codex_core::protocol::SessionConfiguredEvent) {
         self.bottom_pane
@@ -249,9 +316,13 @@ impl ChatWidget {
     }
 
     fn on_agent_message(&mut self, message: String) {
-        let sink = AppEventHistorySink(self.app_event_tx.clone());
-        let finished = self.stream.apply_final_answer(&message, &sink);
-        self.handle_if_stream_finished(finished);
+        // If we have a stream_controller, then the final agent message is redundant and will be a
+        // duplicate of what has already been streamed.
+        if self.stream_controller.is_none() {
+            self.handle_streaming_delta(message);
+        }
+        self.flush_answer_stream_with_separator();
+        self.handle_stream_finished();
         self.request_redraw();
     }
 
@@ -301,19 +372,14 @@ impl ChatWidget {
     fn on_task_started(&mut self) {
         self.bottom_pane.clear_ctrl_c_quit_hint();
         self.bottom_pane.set_task_running(true);
-        self.stream.reset_headers_for_new_turn();
         self.full_reasoning_buffer.clear();
         self.reasoning_buffer.clear();
         self.request_redraw();
     }
 
     fn on_task_complete(&mut self, last_agent_message: Option<String>) {
-        // If a stream is currently active, finalize only that stream to flush any tail
-        // without emitting stray headers for other streams.
-        if self.stream.is_write_cycle_active() {
-            let sink = AppEventHistorySink(self.app_event_tx.clone());
-            let _ = self.stream.finalize(true, &sink);
-        }
+        // If a stream is currently active, finalize it.
+        self.flush_answer_stream_with_separator();
         // Mark task stopped and request redraw now that all content is in history.
         self.bottom_pane.set_task_running(false);
         self.running_commands.clear();
@@ -328,32 +394,50 @@ impl ChatWidget {
     }
 
     pub(crate) fn set_token_info(&mut self, info: Option<TokenUsageInfo>) {
-        self.bottom_pane.set_token_usage(info.clone());
-        self.token_info = info;
+        if info.is_some() {
+            self.token_info = info;
+        }
     }
 
-    fn on_rate_limit_snapshot(&mut self, snapshot: Option<RateLimitSnapshotEvent>) {
+    fn on_rate_limit_snapshot(&mut self, snapshot: Option<RateLimitSnapshot>) {
         if let Some(snapshot) = snapshot {
-            let warnings = self
-                .rate_limit_warnings
-                .take_warnings(snapshot.weekly_used_percent, snapshot.primary_used_percent);
-            self.rate_limit_snapshot = Some(snapshot);
+            let warnings = self.rate_limit_warnings.take_warnings(
+                snapshot
+                    .secondary
+                    .as_ref()
+                    .map(|window| window.used_percent),
+                snapshot
+                    .secondary
+                    .as_ref()
+                    .and_then(|window| window.window_minutes),
+                snapshot.primary.as_ref().map(|window| window.used_percent),
+                snapshot
+                    .primary
+                    .as_ref()
+                    .and_then(|window| window.window_minutes),
+            );
+
+            let display = crate::status::rate_limit_snapshot_display(&snapshot, Local::now());
+            self.rate_limit_snapshot = Some(display);
+
             if !warnings.is_empty() {
                 for warning in warnings {
                     self.add_to_history(history_cell::new_warning_event(warning));
                 }
                 self.request_redraw();
             }
+        } else {
+            self.rate_limit_snapshot = None;
         }
     }
     /// Finalize any active exec as failed and stop/clear running UI state.
     fn finalize_turn(&mut self) {
         // Ensure any spinner is replaced by a red ✗ and flushed into history.
-        self.finalize_active_exec_cell_as_failed();
+        self.finalize_active_cell_as_failed();
         // Reset running state and clear streaming buffers.
         self.bottom_pane.set_task_running(false);
         self.running_commands.clear();
-        self.stream.clear_all();
+        self.stream_controller = None;
     }
 
     fn on_error(&mut self, message: String) {
@@ -380,12 +464,20 @@ impl ChatWidget {
 
         // If any messages were queued during the task, restore them into the composer.
         if !self.queued_user_messages.is_empty() {
-            let combined = self
+            let queued_text = self
                 .queued_user_messages
                 .iter()
                 .map(|m| m.text.clone())
                 .collect::<Vec<_>>()
                 .join("\n");
+            let existing_text = self.bottom_pane.composer_text();
+            let combined = if existing_text.is_empty() {
+                queued_text
+            } else if queued_text.is_empty() {
+                existing_text
+            } else {
+                format!("{queued_text}\n{existing_text}")
+            };
             self.bottom_pane.set_composer_text(combined);
             // Clear the queue and update the status indicator list.
             self.queued_user_messages.clear();
@@ -505,15 +597,20 @@ impl ChatWidget {
         self.add_to_history(history_cell::new_stream_error_event(message));
         self.request_redraw();
     }
+
     /// Periodic tick to commit at most one queued line to history with a small delay,
     /// animating the output.
     pub(crate) fn on_commit_tick(&mut self) {
-        let sink = AppEventHistorySink(self.app_event_tx.clone());
-        let finished = self.stream.on_commit_tick(&sink);
-        self.handle_if_stream_finished(finished);
-    }
-    fn is_write_cycle_active(&self) -> bool {
-        self.stream.is_write_cycle_active()
+        if let Some(controller) = self.stream_controller.as_mut() {
+            let (cell, is_idle) = controller.on_commit_tick();
+            if let Some(cell) = cell {
+                self.bottom_pane.set_task_running(false);
+                self.add_boxed_history(cell);
+            }
+            if is_idle {
+                self.app_event_tx.send(AppEvent::StopCommitAnimation);
+            }
+        }
     }
 
     fn flush_interrupt_queue(&mut self) {
@@ -531,32 +628,43 @@ impl ChatWidget {
         // Preserve deterministic FIFO across queued interrupts: once anything
         // is queued due to an active write cycle, continue queueing until the
         // queue is flushed to avoid reordering (e.g., ExecEnd before ExecBegin).
-        if self.is_write_cycle_active() || !self.interrupts.is_empty() {
+        if self.stream_controller.is_some() || !self.interrupts.is_empty() {
             push(&mut self.interrupts);
         } else {
             handle(self);
         }
     }
 
-    #[inline]
-    fn handle_if_stream_finished(&mut self, finished: bool) {
-        if finished {
-            if self.task_complete_pending {
-                self.bottom_pane.set_task_running(false);
-                self.task_complete_pending = false;
-            }
-            // A completed stream indicates non-exec content was just inserted.
-            self.flush_interrupt_queue();
+    fn handle_stream_finished(&mut self) {
+        if self.task_complete_pending {
+            self.bottom_pane.set_task_running(false);
+            self.task_complete_pending = false;
         }
+        // A completed stream indicates non-exec content was just inserted.
+        self.flush_interrupt_queue();
     }
 
     #[inline]
     fn handle_streaming_delta(&mut self, delta: String) {
         // Before streaming agent content, flush any active exec cell group.
-        self.flush_active_exec_cell();
-        let sink = AppEventHistorySink(self.app_event_tx.clone());
-        self.stream.begin(&sink);
-        self.stream.push_and_maybe_commit(&delta, &sink);
+        self.flush_active_cell();
+
+        if self.stream_controller.is_none() {
+            if self.needs_final_message_separator {
+                let elapsed_seconds = self
+                    .bottom_pane
+                    .status_widget()
+                    .map(super::status_indicator_widget::StatusIndicatorWidget::elapsed_seconds);
+                self.add_to_history(history_cell::FinalMessageSeparator::new(elapsed_seconds));
+                self.needs_final_message_separator = false;
+            }
+            self.stream_controller = Some(StreamController::new(self.config.clone()));
+        }
+        if let Some(controller) = self.stream_controller.as_mut()
+            && controller.push(&delta)
+        {
+            self.app_event_tx.send(AppEvent::StartCommitAnimation);
+        }
         self.request_redraw();
     }
 
@@ -567,16 +675,25 @@ impl ChatWidget {
             None => (vec![ev.call_id.clone()], Vec::new()),
         };
 
-        if self.active_exec_cell.is_none() {
-            // This should have been created by handle_exec_begin_now, but in case it wasn't,
-            // create it now.
-            self.active_exec_cell = Some(history_cell::new_active_exec_command(
+        let needs_new = self
+            .active_cell
+            .as_ref()
+            .map(|cell| cell.as_any().downcast_ref::<ExecCell>().is_none())
+            .unwrap_or(true);
+        if needs_new {
+            self.flush_active_cell();
+            self.active_cell = Some(Box::new(new_active_exec_command(
                 ev.call_id.clone(),
                 command,
                 parsed,
-            ));
+            )));
         }
-        if let Some(cell) = self.active_exec_cell.as_mut() {
+
+        if let Some(cell) = self
+            .active_cell
+            .as_mut()
+            .and_then(|c| c.as_any_mut().downcast_mut::<ExecCell>())
+        {
             cell.complete_call(
                 &ev.call_id,
                 CommandOutput {
@@ -588,7 +705,7 @@ impl ChatWidget {
                 ev.duration,
             );
             if cell.should_flush() {
-                self.flush_active_exec_cell();
+                self.flush_active_cell();
             }
         }
     }
@@ -608,7 +725,7 @@ impl ChatWidget {
         self.flush_answer_stream_with_separator();
         // Emit the proposed command into history (like proposed patches)
         self.add_to_history(history_cell::new_proposed_command(&ev.command));
-        let command = shlex::try_join(ev.command.iter().map(|s| s.as_str()))
+        let command = shlex::try_join(ev.command.iter().map(String::as_str))
             .unwrap_or_else(|_| ev.command.join(" "));
         self.notify(Notification::ExecApprovalRequested { command });
 
@@ -655,50 +772,68 @@ impl ChatWidget {
                 parsed_cmd: ev.parsed_cmd.clone(),
             },
         );
-        if let Some(exec) = &self.active_exec_cell {
-            if let Some(new_exec) = exec.with_added_call(
+        if let Some(cell) = self
+            .active_cell
+            .as_mut()
+            .and_then(|c| c.as_any_mut().downcast_mut::<ExecCell>())
+            && let Some(new_exec) = cell.with_added_call(
                 ev.call_id.clone(),
                 ev.command.clone(),
                 ev.parsed_cmd.clone(),
-            ) {
-                self.active_exec_cell = Some(new_exec);
-            } else {
-                // Make a new cell.
-                self.flush_active_exec_cell();
-                self.active_exec_cell = Some(history_cell::new_active_exec_command(
-                    ev.call_id.clone(),
-                    ev.command.clone(),
-                    ev.parsed_cmd,
-                ));
-            }
+            )
+        {
+            *cell = new_exec;
         } else {
-            self.active_exec_cell = Some(history_cell::new_active_exec_command(
+            self.flush_active_cell();
+
+            self.active_cell = Some(Box::new(new_active_exec_command(
                 ev.call_id.clone(),
                 ev.command.clone(),
                 ev.parsed_cmd,
-            ));
+            )));
         }
 
-        // Request a redraw so the working header and command list are visible immediately.
         self.request_redraw();
     }
 
     pub(crate) fn handle_mcp_begin_now(&mut self, ev: McpToolCallBeginEvent) {
         self.flush_answer_stream_with_separator();
-        self.add_to_history(history_cell::new_active_mcp_tool_call(ev.invocation));
+        self.flush_active_cell();
+        self.active_cell = Some(Box::new(history_cell::new_active_mcp_tool_call(
+            ev.call_id,
+            ev.invocation,
+        )));
+        self.request_redraw();
     }
     pub(crate) fn handle_mcp_end_now(&mut self, ev: McpToolCallEndEvent) {
         self.flush_answer_stream_with_separator();
-        self.add_boxed_history(history_cell::new_completed_mcp_tool_call(
-            80,
-            ev.invocation,
-            ev.duration,
-            ev.result
-                .as_ref()
-                .map(|r| !r.is_error.unwrap_or(false))
-                .unwrap_or(false),
-            ev.result,
-        ));
+
+        let McpToolCallEndEvent {
+            call_id,
+            invocation,
+            duration,
+            result,
+        } = ev;
+
+        let extra_cell = match self
+            .active_cell
+            .as_mut()
+            .and_then(|cell| cell.as_any_mut().downcast_mut::<McpToolCallCell>())
+        {
+            Some(cell) if cell.call_id() == call_id => cell.complete(duration, result),
+            _ => {
+                self.flush_active_cell();
+                let mut cell = history_cell::new_active_mcp_tool_call(call_id, invocation);
+                let extra_cell = cell.complete(duration, result);
+                self.active_cell = Some(Box::new(cell));
+                extra_cell
+            }
+        };
+
+        self.flush_active_cell();
+        if let Some(extra) = extra_cell {
+            self.add_boxed_history(extra);
+        }
     }
 
     fn layout_areas(&self, area: Rect) -> [Rect; 3] {
@@ -706,7 +841,7 @@ impl ChatWidget {
         let remaining = area.height.saturating_sub(bottom_min);
 
         let active_desired = self
-            .active_exec_cell
+            .active_cell
             .as_ref()
             .map_or(0, |c| c.desired_height(area.width) + 1);
         let active_height = active_desired.min(remaining);
@@ -751,10 +886,10 @@ impl ChatWidget {
                 placeholder_text: placeholder,
                 disable_paste_burst: config.disable_paste_burst,
             }),
-            active_exec_cell: None,
+            active_cell: None,
             config: config.clone(),
             auth_manager,
-            session_header: SessionHeader::new(config.model.clone()),
+            session_header: SessionHeader::new(config.model),
             initial_user_message: create_initial_user_message(
                 initial_prompt.unwrap_or_default(),
                 initial_images,
@@ -762,7 +897,7 @@ impl ChatWidget {
             token_info: None,
             rate_limit_snapshot: None,
             rate_limit_warnings: RateLimitWarningState::default(),
-            stream: StreamController::new(config),
+            stream_controller: None,
             running_commands: HashMap::new(),
             task_complete_pending: false,
             interrupts: InterruptManager::new(),
@@ -774,6 +909,9 @@ impl ChatWidget {
             suppress_session_configured_redraw: false,
             pending_notification: None,
             is_review_mode: false,
+            ghost_snapshots: Vec::new(),
+            ghost_snapshots_disabled: true,
+            needs_final_message_separator: false,
         }
     }
 
@@ -810,10 +948,10 @@ impl ChatWidget {
                 placeholder_text: placeholder,
                 disable_paste_burst: config.disable_paste_burst,
             }),
-            active_exec_cell: None,
+            active_cell: None,
             config: config.clone(),
             auth_manager,
-            session_header: SessionHeader::new(config.model.clone()),
+            session_header: SessionHeader::new(config.model),
             initial_user_message: create_initial_user_message(
                 initial_prompt.unwrap_or_default(),
                 initial_images,
@@ -821,7 +959,7 @@ impl ChatWidget {
             token_info: None,
             rate_limit_snapshot: None,
             rate_limit_warnings: RateLimitWarningState::default(),
-            stream: StreamController::new(config),
+            stream_controller: None,
             running_commands: HashMap::new(),
             task_complete_pending: false,
             interrupts: InterruptManager::new(),
@@ -833,13 +971,16 @@ impl ChatWidget {
             suppress_session_configured_redraw: true,
             pending_notification: None,
             is_review_mode: false,
+            ghost_snapshots: Vec::new(),
+            ghost_snapshots_disabled: true,
+            needs_final_message_separator: false,
         }
     }
 
     pub fn desired_height(&self, width: u16) -> u16 {
         self.bottom_pane.desired_height(width)
             + self
-                .active_exec_cell
+                .active_cell
                 .as_ref()
                 .map_or(0, |c| c.desired_height(width) + 1)
     }
@@ -965,6 +1106,9 @@ impl ChatWidget {
                 }
                 self.app_event_tx.send(AppEvent::ExitRequest);
             }
+            SlashCommand::Undo => {
+                self.undo_last_snapshot();
+            }
             SlashCommand::Diff => {
                 self.add_diff_in_progress();
                 let tx = self.app_event_tx.clone();
@@ -987,9 +1131,6 @@ impl ChatWidget {
             }
             SlashCommand::Status => {
                 self.add_status_output();
-            }
-            SlashCommand::Limits => {
-                self.add_limits_output();
             }
             SlashCommand::Mcp => {
                 self.add_mcp_output();
@@ -1057,10 +1198,10 @@ impl ChatWidget {
         }
     }
 
-    fn flush_active_exec_cell(&mut self) {
-        if let Some(active) = self.active_exec_cell.take() {
-            self.app_event_tx
-                .send(AppEvent::InsertHistoryCell(Box::new(active)));
+    fn flush_active_cell(&mut self) {
+        if let Some(active) = self.active_cell.take() {
+            self.needs_final_message_separator = true;
+            self.app_event_tx.send(AppEvent::InsertHistoryCell(active));
         }
     }
 
@@ -1071,13 +1212,20 @@ impl ChatWidget {
     fn add_boxed_history(&mut self, cell: Box<dyn HistoryCell>) {
         if !cell.display_lines(u16::MAX).is_empty() {
             // Only break exec grouping if the cell renders visible lines.
-            self.flush_active_exec_cell();
+            self.flush_active_cell();
+            self.needs_final_message_separator = true;
         }
         self.app_event_tx.send(AppEvent::InsertHistoryCell(cell));
     }
 
     fn submit_user_message(&mut self, user_message: UserMessage) {
         let UserMessage { text, image_paths } = user_message;
+        if text.is_empty() && image_paths.is_empty() {
+            return;
+        }
+
+        self.capture_ghost_snapshot();
+
         let mut items: Vec<InputItem> = Vec::new();
 
         if !text.is_empty() {
@@ -1086,10 +1234,6 @@ impl ChatWidget {
 
         for path in image_paths {
             items.push(InputItem::LocalImage { path });
-        }
-
-        if items.is_empty() {
-            return;
         }
 
         self.codex_op_tx
@@ -1111,6 +1255,58 @@ impl ChatWidget {
         if !text.is_empty() {
             self.add_to_history(history_cell::new_user_prompt(text));
         }
+        self.needs_final_message_separator = false;
+    }
+
+    fn capture_ghost_snapshot(&mut self) {
+        if self.ghost_snapshots_disabled {
+            return;
+        }
+
+        let options = CreateGhostCommitOptions::new(&self.config.cwd);
+        match create_ghost_commit(&options) {
+            Ok(commit) => {
+                self.ghost_snapshots.push(commit);
+                if self.ghost_snapshots.len() > MAX_TRACKED_GHOST_COMMITS {
+                    self.ghost_snapshots.remove(0);
+                }
+            }
+            Err(err) => {
+                self.ghost_snapshots_disabled = true;
+                let (message, hint) = match &err {
+                    GitToolingError::NotAGitRepository { .. } => (
+                        "Snapshots disabled: current directory is not a Git repository."
+                            .to_string(),
+                        None,
+                    ),
+                    _ => (
+                        format!("Snapshots disabled after error: {err}"),
+                        Some(
+                            "Restart Codex after resolving the issue to re-enable snapshots."
+                                .to_string(),
+                        ),
+                    ),
+                };
+                self.add_info_message(message, hint);
+                tracing::warn!("failed to create ghost snapshot: {err}");
+            }
+        }
+    }
+
+    fn undo_last_snapshot(&mut self) {
+        let Some(commit) = self.ghost_snapshots.pop() else {
+            self.add_info_message("No snapshot available to undo.".to_string(), None);
+            return;
+        };
+
+        if let Err(err) = restore_ghost_commit(&self.config.cwd, &commit) {
+            self.add_error_message(format!("Failed to restore snapshot: {err}"));
+            self.ghost_snapshots.push(commit);
+            return;
+        }
+
+        let short_id: String = commit.id().chars().take(8).collect();
+        self.add_info_message(format!("Restored workspace to snapshot {short_id}"), None);
     }
 
     /// Replay a subset of initial events into the UI to seed the transcript when
@@ -1239,7 +1435,7 @@ impl ChatWidget {
         if let Some(output) = review.review_output {
             self.flush_answer_stream_with_separator();
             self.flush_interrupt_queue();
-            self.flush_active_exec_cell();
+            self.flush_active_cell();
 
             if output.findings.is_empty() {
                 let explanation = output.overall_explanation.trim().to_string();
@@ -1308,12 +1504,16 @@ impl ChatWidget {
         }
     }
 
-    /// Mark the active exec cell as failed (✗) and flush it into history.
-    fn finalize_active_exec_cell_as_failed(&mut self) {
-        if let Some(cell) = self.active_exec_cell.take() {
-            let cell = cell.into_failed();
-            // Insert finalized exec into history and keep grouping consistent.
-            self.add_to_history(cell);
+    /// Mark the active cell as failed (✗) and flush it into history.
+    fn finalize_active_cell_as_failed(&mut self) {
+        if let Some(mut cell) = self.active_cell.take() {
+            // Insert finalized cell into history and keep grouping consistent.
+            if let Some(exec) = cell.as_any_mut().downcast_mut::<ExecCell>() {
+                exec.mark_failed();
+            } else if let Some(tool) = cell.as_any_mut().downcast_mut::<McpToolCallCell>() {
+                tool.mark_failed();
+            }
+            self.add_boxed_history(cell);
         }
     }
 
@@ -1347,15 +1547,6 @@ impl ChatWidget {
         self.request_redraw();
     }
 
-    pub(crate) fn add_limits_output(&mut self) {
-        if let Some(snapshot) = &self.rate_limit_snapshot {
-            self.add_to_history(history_cell::new_limits_output(snapshot));
-        } else {
-            self.add_to_history(history_cell::new_limits_unavailable());
-        }
-        self.request_redraw();
-    }
-
     pub(crate) fn add_status_output(&mut self) {
         let default_usage;
         let usage_ref = if let Some(ti) = &self.token_info {
@@ -1364,10 +1555,11 @@ impl ChatWidget {
             default_usage = TokenUsage::default();
             &default_usage
         };
-        self.add_to_history(history_cell::new_status_output(
+        self.add_to_history(crate::status::new_status_output(
             &self.config,
             usage_ref,
             &self.conversation_id,
+            self.rate_limit_snapshot.as_ref(),
         ));
     }
 
@@ -1648,7 +1840,6 @@ impl ChatWidget {
             title: "Select a review preset".into(),
             footer_hint: Some(STANDARD_POPUP_HINT_LINE.to_string()),
             items,
-            on_escape: None,
             ..Default::default()
         });
     }
@@ -1670,7 +1861,7 @@ impl ChatWidget {
                     tx3.send(AppEvent::CodexOp(Op::Review {
                         review_request: ReviewRequest {
                             prompt: format!(
-                                "Review the code changes against the base branch '{branch}'. Start by finding the merge diff between the current branch and {branch} e.g. (git merge-base HEAD {branch}), then run `git diff` against that SHA to see what changes we would merge into the {branch} branch. Provide prioritized, actionable findings."
+                                "Review the code changes against the base branch '{branch}'. Start by finding the merge diff between the current branch and {branch}'s upstream e.g. (`git merge-base HEAD \"$(git rev-parse --abbrev-ref \"{branch}@{{upstream}}\")\"`), then run `git diff` against that SHA to see what changes we would merge into the {branch} branch. Provide prioritized, actionable findings."
                             ),
                             user_facing_hint: format!("changes against '{branch}'"),
                         },
@@ -1687,7 +1878,6 @@ impl ChatWidget {
             items,
             is_searchable: true,
             search_placeholder: Some("Type to search branches".to_string()),
-            on_escape: Some(Box::new(|tx| tx.send(AppEvent::OpenReviewPopup))),
             ..Default::default()
         });
     }
@@ -1729,7 +1919,6 @@ impl ChatWidget {
             items,
             is_searchable: true,
             search_placeholder: Some("Type to search commits".to_string()),
-            on_escape: Some(Box::new(|tx| tx.send(AppEvent::OpenReviewPopup))),
             ..Default::default()
         });
     }
@@ -1740,8 +1929,6 @@ impl ChatWidget {
             "Custom review instructions".to_string(),
             "Type instructions and press Enter".to_string(),
             None,
-            self.app_event_tx.clone(),
-            Some(Box::new(|tx| tx.send(AppEvent::OpenReviewPopup))),
             Box::new(move |prompt: String| {
                 let trimmed = prompt.trim().to_string();
                 if trimmed.is_empty() {
@@ -1787,7 +1974,6 @@ impl ChatWidget {
 
     pub(crate) fn clear_token_usage(&mut self) {
         self.token_info = None;
-        self.bottom_pane.set_token_usage(None);
     }
 
     pub fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
@@ -1801,12 +1987,16 @@ impl WidgetRef for &ChatWidget {
         let [_, active_cell_area, bottom_pane_area] = self.layout_areas(area);
         (&self.bottom_pane).render(bottom_pane_area, buf);
         if !active_cell_area.is_empty()
-            && let Some(cell) = &self.active_exec_cell
+            && let Some(cell) = &self.active_cell
         {
-            let mut active_cell_area = active_cell_area;
-            active_cell_area.y = active_cell_area.y.saturating_add(1);
-            active_cell_area.height -= 1;
-            cell.render_ref(active_cell_area, buf);
+            let mut area = active_cell_area;
+            area.y = area.y.saturating_add(1);
+            area.height = area.height.saturating_sub(1);
+            if let Some(exec) = cell.as_any().downcast_ref::<ExecCell>() {
+                exec.render_ref(area, buf);
+            } else if let Some(tool) = cell.as_any().downcast_ref::<McpToolCallCell>() {
+                tool.render_ref(area, buf);
+            }
         }
     }
 }
