@@ -2,20 +2,19 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
-use codex_protocol::models::ResponseInputItem;
-use tracing::warn;
-
 use crate::client_common::tools::ToolSpec;
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
+use async_trait::async_trait;
+use codex_protocol::models::ResponseInputItem;
+use codex_utils_readiness::Readiness;
+use tracing::warn;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ToolKind {
     Function,
-    UnifiedExec,
     Mcp,
 }
 
@@ -27,13 +26,15 @@ pub trait ToolHandler: Send + Sync {
         matches!(
             (self.kind(), payload),
             (ToolKind::Function, ToolPayload::Function { .. })
-                | (ToolKind::UnifiedExec, ToolPayload::UnifiedExec { .. })
                 | (ToolKind::Mcp, ToolPayload::Mcp { .. })
         )
     }
 
-    async fn handle(&self, invocation: ToolInvocation<'_>)
-    -> Result<ToolOutput, FunctionCallError>;
+    fn is_mutating(&self, _invocation: &ToolInvocation) -> bool {
+        false
+    }
+
+    async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutput, FunctionCallError>;
 }
 
 pub struct ToolRegistry {
@@ -57,9 +58,9 @@ impl ToolRegistry {
     //     }
     // }
 
-    pub async fn dispatch<'a>(
+    pub async fn dispatch(
         &self,
-        invocation: ToolInvocation<'a>,
+        invocation: ToolInvocation,
     ) -> Result<ResponseInputItem, FunctionCallError> {
         let tool_name = invocation.tool_name.clone();
         let call_id_owned = invocation.call_id.clone();
@@ -109,6 +110,11 @@ impl ToolRegistry {
                     let output_cell = &output_cell;
                     let invocation = invocation;
                     async move {
+                        if handler.is_mutating(&invocation) {
+                            tracing::trace!("waiting for tool gate");
+                            invocation.turn.tool_call_gate.wait_ready().await;
+                            tracing::trace!("tool gate released");
+                        }
                         match handler.handle(invocation).await {
                             Ok(output) => {
                                 let preview = output.log_preview();
@@ -137,9 +143,24 @@ impl ToolRegistry {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ConfiguredToolSpec {
+    pub spec: ToolSpec,
+    pub supports_parallel_tool_calls: bool,
+}
+
+impl ConfiguredToolSpec {
+    pub fn new(spec: ToolSpec, supports_parallel_tool_calls: bool) -> Self {
+        Self {
+            spec,
+            supports_parallel_tool_calls,
+        }
+    }
+}
+
 pub struct ToolRegistryBuilder {
     handlers: HashMap<String, Arc<dyn ToolHandler>>,
-    specs: Vec<ToolSpec>,
+    specs: Vec<ConfiguredToolSpec>,
 }
 
 impl ToolRegistryBuilder {
@@ -151,7 +172,16 @@ impl ToolRegistryBuilder {
     }
 
     pub fn push_spec(&mut self, spec: ToolSpec) {
-        self.specs.push(spec);
+        self.push_spec_with_parallel_support(spec, false);
+    }
+
+    pub fn push_spec_with_parallel_support(
+        &mut self,
+        spec: ToolSpec,
+        supports_parallel_tool_calls: bool,
+    ) {
+        self.specs
+            .push(ConfiguredToolSpec::new(spec, supports_parallel_tool_calls));
     }
 
     pub fn register_handler(&mut self, name: impl Into<String>, handler: Arc<dyn ToolHandler>) {
@@ -183,7 +213,7 @@ impl ToolRegistryBuilder {
     //     }
     // }
 
-    pub fn build(self) -> (Vec<ToolSpec>, ToolRegistry) {
+    pub fn build(self) -> (Vec<ConfiguredToolSpec>, ToolRegistry) {
         let registry = ToolRegistry::new(self.handlers);
         (self.specs, registry)
     }

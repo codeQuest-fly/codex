@@ -23,6 +23,11 @@ use tokio::sync::mpsc;
 /// Review thread system prompt. Edit `core/src/review_prompt.md` to customize.
 pub const REVIEW_PROMPT: &str = include_str!("../review_prompt.md");
 
+// Centralized templates for review-related user messages
+pub const REVIEW_EXIT_SUCCESS_TMPL: &str = include_str!("../templates/review/exit_success.xml");
+pub const REVIEW_EXIT_INTERRUPTED_TMPL: &str =
+    include_str!("../templates/review/exit_interrupted.xml");
+
 /// API request payload for a single model turn
 #[derive(Default, Debug, Clone)]
 pub struct Prompt {
@@ -32,6 +37,9 @@ pub struct Prompt {
     /// Tools available to the model, including additional tools sourced from
     /// external MCP servers.
     pub(crate) tools: Vec<ToolSpec>,
+
+    /// Whether parallel tool calls are permitted for this prompt.
+    pub(crate) parallel_tool_calls: bool,
 
     /// Optional override for the built-in BASE_INSTRUCTIONS.
     pub base_instructions_override: Option<String>,
@@ -156,12 +164,16 @@ fn build_structured_output(parsed: &ExecOutputJson) -> String {
         parsed.metadata.duration_seconds
     ));
 
+    let mut output = parsed.output.clone();
     if let Some(total_lines) = extract_total_output_lines(&parsed.output) {
         sections.push(format!("Total output lines: {total_lines}"));
+        if let Some(stripped) = strip_total_output_header(&output) {
+            output = stripped.to_string();
+        }
     }
 
     sections.push("Output:".to_string());
-    sections.push(parsed.output.clone());
+    sections.push(output);
 
     sections.join("\n")
 }
@@ -174,10 +186,18 @@ fn extract_total_output_lines(output: &str) -> Option<u32> {
     total_segment.parse::<u32>().ok()
 }
 
+fn strip_total_output_header(output: &str) -> Option<&str> {
+    let after_prefix = output.strip_prefix("Total output lines: ")?;
+    let (_, remainder) = after_prefix.split_once('\n')?;
+    let remainder = remainder.strip_prefix('\n').unwrap_or(remainder);
+    Some(remainder)
+}
+
 #[derive(Debug)]
 pub enum ResponseEvent {
     Created,
     OutputItemDone(ResponseItem),
+    OutputItemAdded(ResponseItem),
     Completed {
         response_id: String,
         token_usage: Option<TokenUsage>,
@@ -186,9 +206,6 @@ pub enum ResponseEvent {
     ReasoningSummaryDelta(String),
     ReasoningContentDelta(String),
     ReasoningSummaryPartAdded,
-    WebSearchCallBegin {
-        call_id: String,
-    },
     RateLimits(RateLimitSnapshot),
 }
 
@@ -267,7 +284,7 @@ pub(crate) struct ResponsesApiRequest<'a> {
 }
 
 pub(crate) mod tools {
-    use crate::openai_tools::JsonSchema;
+    use crate::tools::spec::JsonSchema;
     use serde::Deserialize;
     use serde::Serialize;
 
@@ -286,6 +303,17 @@ pub(crate) mod tools {
         WebSearch {},
         #[serde(rename = "custom")]
         Freeform(FreeformTool),
+    }
+
+    impl ToolSpec {
+        pub(crate) fn name(&self) -> &str {
+            match self {
+                ToolSpec::Function(tool) => tool.name.as_str(),
+                ToolSpec::LocalShell {} => "local_shell",
+                ToolSpec::WebSearch {} => "web_search",
+                ToolSpec::Freeform(tool) => tool.name.as_str(),
+            }
+        }
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -312,21 +340,6 @@ pub(crate) mod tools {
         pub(crate) strict: bool,
         pub(crate) parameters: JsonSchema,
     }
-}
-
-pub(crate) fn create_reasoning_param_for_request(
-    model_family: &ModelFamily,
-    effort: Option<ReasoningEffortConfig>,
-    summary: ReasoningSummaryConfig,
-) -> Option<Reasoning> {
-    if !model_family.supports_reasoning_summaries {
-        return None;
-    }
-
-    Some(Reasoning {
-        effort,
-        summary: Some(summary),
-    })
 }
 
 pub(crate) fn create_text_param_for_request(
@@ -394,6 +407,10 @@ mod tests {
                 expects_apply_patch_instructions: true,
             },
             InstructionsTestCase {
+                slug: "gpt-5.1",
+                expects_apply_patch_instructions: false,
+            },
+            InstructionsTestCase {
                 slug: "codex-mini-latest",
                 expects_apply_patch_instructions: true,
             },
@@ -403,6 +420,10 @@ mod tests {
             },
             InstructionsTestCase {
                 slug: "gpt-5-codex",
+                expects_apply_patch_instructions: false,
+            },
+            InstructionsTestCase {
+                slug: "gpt-5.1-codex",
                 expects_apply_patch_instructions: false,
             },
         ];
@@ -433,7 +454,7 @@ mod tests {
             input: &input,
             tools: &tools,
             tool_choice: "auto",
-            parallel_tool_calls: false,
+            parallel_tool_calls: true,
             reasoning: None,
             store: false,
             stream: true,
@@ -474,7 +495,7 @@ mod tests {
             input: &input,
             tools: &tools,
             tool_choice: "auto",
-            parallel_tool_calls: false,
+            parallel_tool_calls: true,
             reasoning: None,
             store: false,
             stream: true,
@@ -510,7 +531,7 @@ mod tests {
             input: &input,
             tools: &tools,
             tool_choice: "auto",
-            parallel_tool_calls: false,
+            parallel_tool_calls: true,
             reasoning: None,
             store: false,
             stream: true,
