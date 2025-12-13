@@ -12,7 +12,6 @@ use std::time::Duration;
 
 use crate::ConversationId;
 use crate::approvals::ElicitationRequestEvent;
-use crate::config_types::ReasoningEffort as ReasoningEffortConfig;
 use crate::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use crate::custom_prompts::CustomPrompt;
 use crate::items::TurnItem;
@@ -20,9 +19,11 @@ use crate::message_history::HistoryEntry;
 use crate::models::ContentItem;
 use crate::models::ResponseItem;
 use crate::num_format::format_with_separators;
+use crate::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use crate::parse_command::ParsedCommand;
 use crate::plan_tool::UpdatePlanArgs;
 use crate::user_input::UserInput;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use mcp_types::CallToolResult;
 use mcp_types::RequestId;
 use mcp_types::Resource as McpResource;
@@ -34,13 +35,13 @@ use serde::Serialize;
 use serde_json::Value;
 use serde_with::serde_as;
 use strum_macros::Display;
+use tracing::error;
 use ts_rs::TS;
 
 pub use crate::approvals::ApplyPatchApprovalRequestEvent;
 pub use crate::approvals::ElicitationAction;
 pub use crate::approvals::ExecApprovalRequestEvent;
-pub use crate::approvals::SandboxCommandAssessment;
-pub use crate::approvals::SandboxRiskLevel;
+pub use crate::approvals::ExecPolicyAmendment;
 
 /// Open/close tags for special user-input blocks. Used across crates to avoid
 /// duplicated hardcoded strings.
@@ -208,6 +209,9 @@ pub enum Op {
         /// The raw command string after '!'
         command: String,
     },
+
+    /// Request the list of available models.
+    ListModels,
 }
 
 /// Determines the conditions under which the user is consulted to approve
@@ -271,7 +275,7 @@ pub enum SandboxPolicy {
         /// Additional folders (beyond cwd and possibly TMPDIR) that should be
         /// writable from within the sandbox.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        writable_roots: Vec<PathBuf>,
+        writable_roots: Vec<AbsolutePathBuf>,
 
         /// When set to `true`, outbound network access is allowed. `false` by
         /// default.
@@ -297,11 +301,9 @@ pub enum SandboxPolicy {
 /// not modified by the agent.
 #[derive(Debug, Clone, PartialEq, Eq, JsonSchema)]
 pub struct WritableRoot {
-    /// Absolute path, by construction.
-    pub root: PathBuf,
+    pub root: AbsolutePathBuf,
 
-    /// Also absolute paths, by construction.
-    pub read_only_subpaths: Vec<PathBuf>,
+    pub read_only_subpaths: Vec<AbsolutePathBuf>,
 }
 
 impl WritableRoot {
@@ -383,16 +385,30 @@ impl SandboxPolicy {
                 network_access: _,
             } => {
                 // Start from explicitly configured writable roots.
-                let mut roots: Vec<PathBuf> = writable_roots.clone();
+                let mut roots: Vec<AbsolutePathBuf> = writable_roots.clone();
 
                 // Always include defaults: cwd, /tmp (if present on Unix), and
                 // on macOS, the per-user TMPDIR unless explicitly excluded.
-                roots.push(cwd.to_path_buf());
+                // TODO(mbolin): cwd param should be AbsolutePathBuf.
+                let cwd_absolute = AbsolutePathBuf::from_absolute_path(cwd);
+                match cwd_absolute {
+                    Ok(cwd) => {
+                        roots.push(cwd);
+                    }
+                    Err(e) => {
+                        error!(
+                            "Ignoring invalid cwd {:?} for sandbox writable root: {}",
+                            cwd, e
+                        );
+                    }
+                }
 
                 // Include /tmp on Unix unless explicitly excluded.
                 if cfg!(unix) && !exclude_slash_tmp {
-                    let slash_tmp = PathBuf::from("/tmp");
-                    if slash_tmp.is_dir() {
+                    #[allow(clippy::expect_used)]
+                    let slash_tmp =
+                        AbsolutePathBuf::from_absolute_path("/tmp").expect("/tmp is absolute");
+                    if slash_tmp.as_path().is_dir() {
                         roots.push(slash_tmp);
                     }
                 }
@@ -409,7 +425,16 @@ impl SandboxPolicy {
                     && let Some(tmpdir) = std::env::var_os("TMPDIR")
                     && !tmpdir.is_empty()
                 {
-                    roots.push(PathBuf::from(tmpdir));
+                    match AbsolutePathBuf::from_absolute_path(PathBuf::from(&tmpdir)) {
+                        Ok(tmpdir_path) => {
+                            roots.push(tmpdir_path);
+                        }
+                        Err(e) => {
+                            error!(
+                                "Ignoring invalid TMPDIR value {tmpdir:?} for sandbox writable root: {e}",
+                            );
+                        }
+                    }
                 }
 
                 // For each root, compute subpaths that should remain read-only.
@@ -417,8 +442,11 @@ impl SandboxPolicy {
                     .into_iter()
                     .map(|writable_root| {
                         let mut subpaths = Vec::new();
-                        let top_level_git = writable_root.join(".git");
-                        if top_level_git.is_dir() {
+                        #[allow(clippy::expect_used)]
+                        let top_level_git = writable_root
+                            .join(".git")
+                            .expect(".git is a valid relative path");
+                        if top_level_git.as_path().is_dir() {
                             subpaths.push(top_level_git);
                         }
                         WritableRoot {
@@ -454,6 +482,9 @@ pub enum EventMsg {
     /// Warning issued while processing a submission. Unlike `Error`, this
     /// indicates the task continued but the user should still be notified.
     Warning(WarningEvent),
+
+    /// Conversation history was compacted (either automatically or manually).
+    ContextCompacted(ContextCompactedEvent),
 
     /// Agent has started a task
     TaskStarted(TaskStartedEvent),
@@ -510,6 +541,9 @@ pub enum EventMsg {
 
     /// Incremental chunk of output from a running command.
     ExecCommandOutputDelta(ExecCommandOutputDeltaEvent),
+
+    /// Terminal interaction for an in-progress command (stdin sent and stdout observed).
+    TerminalInteraction(TerminalInteractionEvent),
 
     ExecCommandEnd(ExecCommandEndEvent),
 
@@ -740,6 +774,9 @@ pub struct WarningEvent {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+pub struct ContextCompactedEvent;
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct TaskCompleteEvent {
     pub last_agent_message: Option<String>,
 }
@@ -837,6 +874,7 @@ pub struct RateLimitSnapshot {
     pub primary: Option<RateLimitWindow>,
     pub secondary: Option<RateLimitWindow>,
     pub credits: Option<CreditsSnapshot>,
+    pub plan_type: Option<crate::account::PlanType>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema, TS)]
@@ -1131,6 +1169,29 @@ pub enum SubAgentSource {
     Other(String),
 }
 
+impl fmt::Display for SessionSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SessionSource::Cli => f.write_str("cli"),
+            SessionSource::VSCode => f.write_str("vscode"),
+            SessionSource::Exec => f.write_str("exec"),
+            SessionSource::Mcp => f.write_str("mcp"),
+            SessionSource::SubAgent(sub_source) => write!(f, "subagent_{sub_source}"),
+            SessionSource::Unknown => f.write_str("unknown"),
+        }
+    }
+}
+
+impl fmt::Display for SubAgentSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SubAgentSource::Review => f.write_str("review"),
+            SubAgentSource::Compact => f.write_str("compact"),
+            SubAgentSource::Other(other) => f.write_str(other),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, TS)]
 pub struct SessionMeta {
     pub id: ConversationId,
@@ -1227,13 +1288,47 @@ pub struct GitInfo {
     pub repository_url: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewDelivery {
+    Inline,
+    Detached,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema, TS)]
+#[serde(tag = "type", rename_all = "camelCase")]
+#[ts(tag = "type")]
+pub enum ReviewTarget {
+    /// Review the working tree: staged, unstaged, and untracked files.
+    UncommittedChanges,
+
+    /// Review changes between the current branch and the given base branch.
+    #[serde(rename_all = "camelCase")]
+    #[ts(rename_all = "camelCase")]
+    BaseBranch { branch: String },
+
+    /// Review the changes introduced by a specific commit.
+    #[serde(rename_all = "camelCase")]
+    #[ts(rename_all = "camelCase")]
+    Commit {
+        sha: String,
+        /// Optional human-readable label (e.g., commit subject) for UIs.
+        title: Option<String>,
+    },
+
+    /// Arbitrary instructions provided by the user.
+    #[serde(rename_all = "camelCase")]
+    #[ts(rename_all = "camelCase")]
+    Custom { instructions: String },
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
 /// Review request sent to the review session.
 pub struct ReviewRequest {
-    pub prompt: String,
-    pub user_facing_hint: String,
-    #[serde(default)]
-    pub append_to_original_thread: bool,
+    pub target: ReviewTarget,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub user_facing_hint: Option<String>,
 }
 
 /// Structured review result produced by a child review session.
@@ -1280,7 +1375,7 @@ pub struct ReviewLineRange {
     pub end: u32,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[derive(Debug, Clone, Copy, Display, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecCommandSource {
     Agent,
@@ -1299,6 +1394,10 @@ impl Default for ExecCommandSource {
 pub struct ExecCommandBeginEvent {
     /// Identifier so this can be paired with the ExecCommandEnd event.
     pub call_id: String,
+    /// Identifier for the underlying PTY process (when available).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub process_id: Option<String>,
     /// Turn ID that this command belongs to.
     pub turn_id: String,
     /// The command to be executed.
@@ -1319,6 +1418,10 @@ pub struct ExecCommandBeginEvent {
 pub struct ExecCommandEndEvent {
     /// Identifier for the ExecCommandBegin that finished.
     pub call_id: String,
+    /// Identifier for the underlying PTY process (when available).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub process_id: Option<String>,
     /// Turn ID that this command belongs to.
     pub turn_id: String,
     /// The command that was executed.
@@ -1377,6 +1480,17 @@ pub struct ExecCommandOutputDeltaEvent {
     #[schemars(with = "String")]
     #[ts(type = "string")]
     pub chunk: Vec<u8>,
+}
+
+#[serde_as]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
+pub struct TerminalInteractionEvent {
+    /// Identifier for the ExecCommandBegin that produced this chunk.
+    pub call_id: String,
+    /// Process id associated with the running command.
+    pub process_id: String,
+    /// Stdin sent to the running session.
+    pub stdin: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
@@ -1537,6 +1651,25 @@ pub struct ListCustomPromptsResponseEvent {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+pub struct SkillInfo {
+    pub name: String,
+    pub description: String,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+pub struct SkillErrorInfo {
+    pub path: PathBuf,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS, Default)]
+pub struct SkillLoadOutcomeInfo {
+    pub skills: Vec<SkillInfo>,
+    pub errors: Vec<SkillErrorInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct SessionConfiguredEvent {
     /// Name left as session_id instead of conversation_id for backwards compatibility.
     pub session_id: ConversationId,
@@ -1571,17 +1704,24 @@ pub struct SessionConfiguredEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub initial_messages: Option<Vec<EventMsg>>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skill_load_outcome: Option<SkillLoadOutcomeInfo>,
+
     pub rollout_path: PathBuf,
 }
 
 /// User's decision in response to an ExecApprovalRequest.
-#[derive(
-    Debug, Default, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Display, JsonSchema, TS,
-)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq, Display, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewDecision {
     /// User has approved this command and the agent should execute it.
     Approved,
+
+    /// User has approved this command and wants to apply the proposed execpolicy
+    /// amendment so future matching commands are permitted.
+    ApprovedExecpolicyAmendment {
+        proposed_execpolicy_amendment: ExecPolicyAmendment,
+    },
 
     /// User has approved this command and wants to automatically approve any
     /// future identical instances (`command` and `cwd` match exactly) for the
@@ -1694,6 +1834,7 @@ mod tests {
                 history_log_id: 0,
                 history_entry_count: 0,
                 initial_messages: None,
+                skill_load_outcome: None,
                 rollout_path: rollout_file.path().to_path_buf(),
             }),
         };

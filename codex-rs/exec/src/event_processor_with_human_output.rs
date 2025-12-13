@@ -140,7 +140,8 @@ impl EventProcessor for EventProcessorWithHumanOutput {
             VERSION
         );
 
-        let mut entries = create_config_summary_entries(config);
+        let mut entries =
+            create_config_summary_entries(config, session_configured_event.model.as_str());
         entries.push((
             "session id",
             session_configured_event.session_id.to_string(),
@@ -559,10 +560,14 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                     ts_msg!(self, "task aborted: review ended");
                 }
             },
+            EventMsg::ContextCompacted(_) => {
+                ts_msg!(self, "context compacted");
+            }
             EventMsg::ShutdownComplete => return CodexStatus::Shutdown,
             EventMsg::WebSearchBegin(_)
             | EventMsg::ExecApprovalRequest(_)
             | EventMsg::ApplyPatchApprovalRequest(_)
+            | EventMsg::TerminalInteraction(_)
             | EventMsg::ExecCommandOutputDelta(_)
             | EventMsg::GetHistoryEntryResponse(_)
             | EventMsg::McpListToolsResponse(_)

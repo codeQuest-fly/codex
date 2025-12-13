@@ -28,7 +28,7 @@ pub(crate) fn should_persist_response_item(item: &ResponseItem) -> bool {
         | ResponseItem::CustomToolCallOutput { .. }
         | ResponseItem::WebSearchCall { .. }
         | ResponseItem::GhostSnapshot { .. }
-        | ResponseItem::CompactionSummary { .. } => true,
+        | ResponseItem::Compaction { .. } => true,
         ResponseItem::Other => false,
     }
 }
@@ -42,6 +42,7 @@ pub(crate) fn should_persist_event_msg(ev: &EventMsg) -> bool {
         | EventMsg::AgentReasoning(_)
         | EventMsg::AgentReasoningRawContent(_)
         | EventMsg::TokenCount(_)
+        | EventMsg::ContextCompacted(_)
         | EventMsg::EnteredReviewMode(_)
         | EventMsg::ExitedReviewMode(_)
         | EventMsg::UndoCompleted(_)
@@ -61,6 +62,7 @@ pub(crate) fn should_persist_event_msg(ev: &EventMsg) -> bool {
         | EventMsg::WebSearchBegin(_)
         | EventMsg::WebSearchEnd(_)
         | EventMsg::ExecCommandBegin(_)
+        | EventMsg::TerminalInteraction(_)
         | EventMsg::ExecCommandOutputDelta(_)
         | EventMsg::ExecCommandEnd(_)
         | EventMsg::ExecApprovalRequest(_)
